@@ -1,4 +1,9 @@
+2021-10-17  <gaiusmod2@gmail.com>
 
-20-09-2021  <gaiusmod2@gmail.com>
+	* Implemented simple parallel search using pthreads.
+	* Changed the initial ply settings.
+	* Added clean target to Makefile.am.
+
+2021-09-20  <gaiusmod2@gmail.com>
 
 	* initial commit.
