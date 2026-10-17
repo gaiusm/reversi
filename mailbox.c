@@ -15,12 +15,11 @@ static mailbox *freelist = NULL;  /* list of free mailboxes.  */
 
 static mailbox *mailbox_config (mailbox *mbox, mailbox *prev)
 {
-  mbox->data.result = 0;
-  mbox->data.move_no = 0;
-  mbox->data.positions_explored = 0;
+  mbox->in = 0;
+  mbox->out = 0;
   mbox->prev = prev;
   mbox->item_available = multiprocessor_initSem (0);
-  mbox->space_available = multiprocessor_initSem (1);
+  mbox->space_available = multiprocessor_initSem (MAX_MOVES);
   mbox->mutex = multiprocessor_initSem (1);
   return mbox;
 }
@@ -83,22 +82,36 @@ mailbox *mailbox_kill (mailbox *mbox)
 
 
 /*
- *  send - send (result, move_no, positions_explored) to the mailbox mbox.
+ *  send - send (result, move_no, move_square) to the mailbox mbox.
  */
 
-void mailbox_send (mailbox *mbox, int result, int move_no, int positions_explored)
+void mailbox_send (mailbox *mbox, int result, int move_no, int move_square)
 {
-  /* your code goes here.  */
+  multiprocessor_wait (mbox->space_available);
+  multiprocessor_wait (mbox->mutex);
+  mbox->data[mbox->in].result = result;
+  mbox->data[mbox->in].move_no = move_no;
+  mbox->data[mbox->in].move_square = move_square;
+  mbox->in = (mbox->in + 1) % MAX_MOVES;
+  multiprocessor_signal (mbox->mutex);
+  multiprocessor_signal (mbox->item_available);
 }
 
 
 /*
- *  rec - receive (result, move_no, positions_explored) from the
+ *  rec - receive (result, move_no, move_square) from the
  *        mailbox mbox.
  */
 
 void mailbox_rec (mailbox *mbox,
-		  int *result, int *move_no, int *positions_explored)
+		  int *result, int *move_no, int *move_square)
 {
-  /* your code goes here.  */
+  multiprocessor_wait (mbox->item_available);
+  multiprocessor_wait (mbox->mutex);
+  *result = mbox->data[mbox->out].result;
+  *move_no = mbox->data[mbox->out].move_no;
+  *move_square = mbox->data[mbox->out].move_square;
+  mbox->out = (mbox->out + 1) % MAX_MOVES;
+  multiprocessor_signal (mbox->mutex);
+  multiprocessor_signal (mbox->space_available);
 }

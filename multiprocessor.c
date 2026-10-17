@@ -12,7 +12,8 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <semaphore.h>
-
+#include <errno.h>
+#include <string.h>
 
 #if !defined(TRUE)
 #  define TRUE (1==1)
@@ -29,6 +30,7 @@ static unsigned int sem_used;
 
 int multiprocessor_maxProcessors (void)
 {
+  // return 1;
   return get_nprocs ();
 }
 
@@ -95,11 +97,16 @@ void multiprocessor_killSem (sem_t *base_sem)
 void *multiprocessor_initSharedMemory (unsigned int mem_size)
 {
   void *allocated;
+#if 0
   key_t segid = ftok (".", 'R');
+#else
+  key_t segid = IPC_PRIVATE;
+#endif
   int shmid = shmget (segid, mem_size + MAX_SEMAPHORES * sizeof (sem_t), IPC_CREAT | 0660);
   if (shmid < 0)
     {
-      printf ("shmget failed\n");
+      int error = errno;
+      printf ("shmget failed, errno = %d, %s\n", error, strerror (error));
       exit (1);
     }
   sem_array = (sem_t *) shmat (shmid, (void *)0, 0);

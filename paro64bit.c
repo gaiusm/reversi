@@ -1,7 +1,7 @@
-/* Copyright (C) 2007-2021
+/* Copyright (C) 2007-2026
  * Free Software Foundation, Inc.
  *
- *  Gaius Mulley <gaius@glam.ac.uk> wrote Tiny Othello.
+ *  Gaius Mulley <gaiusmod2@gmail.com> wrote Tiny Othello.
  */
 
 /*
@@ -29,8 +29,10 @@ Free Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
 #include <time.h>
 
 #if !defined(SEQUENTIAL)
+#  include <pthread.h>
 #  include "multiprocessor.h"
 #  include "mailbox.h"
+#  include <string.h>
 #endif
 
 #if !defined(TRUE)
@@ -57,8 +59,8 @@ Free Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
 
 #define ASSERT(X)                    do { if (!(X)) { fprintf(stderr, "%s:%d: assert failed\n", __FILE__, __LINE__); exit(1); } } while (0);
 
-#define INITIALPLY          6
-#define MAXPLY             14
+#define INITIALPLY         12
+#define MAXPLY             18
 #define MAXMOVES           60
 
 #undef USE_CORNER_SCORES
@@ -91,7 +93,9 @@ static BITSET64 Colours;
 static BITSET64 Used;
 static int noPlies = INITIALPLY;
 static int timePerMove = 10;
+#if defined(SEQUENTIAL)
 static int positionsExplored;  /* no of positions evaluated in the current move.  */
+#endif
 
 #if 0
 static int bestMove[MAXPLY+1];
@@ -254,7 +258,7 @@ static __inline__ int makeMove (BITSET64 c, BITSET64 u, int p, int our_colour,
 }
 
 
-static void setup (void)
+static void setupBoard (void)
 {
   INCL(&Used, 35);
   INCL(&Colours, 35);
@@ -410,13 +414,13 @@ static int min (int x, int y)
  *             white and a negative value means a good move for black.
  */
 
-static int evaluate (BITSET64 c, BITSET64 u, int final)
+static int evaluate (BITSET64 c, BITSET64 u, int final, int *totalExplored)
 {
   int score = 0;
   int used = 0;
   int i;
 
-  positionsExplored++;
+  (*totalExplored)++;
   for (i=0; i<MAXPOS; i++) {
     if (IS_USED(u, i)) {
       used++;
@@ -574,7 +578,7 @@ static int humanMove (BITSET64 c, BITSET64 u, int o)
  */
 
 static int alphaBeta (int p, BITSET64 c, BITSET64 u, int depth, int o,
-		      int alpha, int beta)
+		      int alpha, int beta, int *totalExplored)
 {
   BITSET64 m, nc, nu;
   int n, try;
@@ -585,27 +589,28 @@ static int alphaBeta (int p, BITSET64 c, BITSET64 u, int depth, int o,
     nu = u;
   }
   else
-    n = makeMove(c, u, p, o, &m, &nc, &nu);
+    n = makeMove (c, u, p, o, &m, &nc, &nu);
 
   o = 1-o;
   if (depth == 0)
-    return evaluate(c, u, FALSE);
+    return evaluate (c, u, FALSE, totalExplored);
   else {
     int l[MAXMOVES];
-    int n = findPossible(nc, nu, o, &m, l);
+    int n = findPossible (nc, nu, o, &m, l);
     int i;
 
     if (n == 0) {
       if (p == -1)
-	return evaluate(nc, nu, TRUE);
+	return evaluate (nc, nu, TRUE, totalExplored);
       else
 	/* o, forfits a go and 1-o plays a move instead */
-	return alphaBeta(-1, nc, nu, depth, 1-o, alpha, beta);
+	return alphaBeta (-1, nc, nu, depth, 1-o, alpha, beta, totalExplored);
     }
     else if (o == WHITE) {
       /* white to move, move is possible, continue searching */
       for (i=0; i<n; i++) {
-	try = alphaBeta(l[i], nc, nu, depth-1, WHITE, alpha, beta);
+	try = alphaBeta (l[i], nc, nu, depth-1, WHITE,
+			 alpha, beta, totalExplored);
 	if (try > alpha)
 	  /* found a better move */
 	  alpha = try;
@@ -617,7 +622,8 @@ static int alphaBeta (int p, BITSET64 c, BITSET64 u, int depth, int o,
     else {
       /* black to move, move is possible, continue searching */
       for (i=0; i<n; i++) {
-	try = alphaBeta(l[i], nc, nu, depth-1, BLACK, alpha, beta);
+	try = alphaBeta (l[i], nc, nu, depth-1, BLACK,
+			 alpha, beta, totalExplored);
 	if (try < beta)
 	  /* found a better move */
 	  beta = try;
@@ -673,22 +679,142 @@ static void displayBestMoves (int depth, int o)
 }
 #endif
 
-static mailbox *barrier;
-static sem_t *processorAvailable;
+static mailbox *thread_comms;
+static int processorAvailable;
 
 void setupIPC (void)
 {
-  barrier = mailbox_init ();
-  processorAvailable = multiprocessor_initSem (multiprocessor_maxProcessors ());
+  thread_comms = mailbox_init ();
+  processorAvailable = multiprocessor_maxProcessors ();
 }
 
 
 #if !defined(SEQUENTIAL)
-int parallelSearch (int *totalExplored, int *move,
-		    int best, int *l, int noOfMoves,
-		    BITSET64 c, BITSET64 u, int noPlies, int o, int minscore, int maxscore)
+typedef struct moveThread_t {
+  pthread_t tid;
+  BITSET64 colour;
+  BITSET64 used;
+  int noPlies;
+  int playerColour;
+  int minscore;
+  int maxscore;
+  int moveSquare;
+  int moveIndex;
+  int totalExplored;
+} threadInfo;
+
+
+void *worker_thread (void *arg)
 {
-  /* your code goes here.  */
+  threadInfo *ptr = (threadInfo *)arg;
+
+  int attempt = alphaBeta (ptr->moveSquare, ptr->colour, ptr->used,
+			   ptr->noPlies, ptr->playerColour,
+			   ptr->minscore, ptr->maxscore, &ptr->totalExplored);
+  /* We return our results.  */
+  mailbox_send (thread_comms, attempt, ptr->moveIndex, ptr->moveSquare);
+  return NULL;
+}
+
+void
+spawnThread (threadInfo *tptr, BITSET64 colour, BITSET64 used,
+	     int noPlies, int playerColour,
+	     int minscore, int maxscore,
+	     int moveSquare, int moveIndex)
+{
+  int error;
+
+  tptr->colour = colour;
+  tptr->used = used;
+  tptr->noPlies = noPlies;
+  tptr->playerColour = playerColour;
+  tptr->minscore = minscore;
+  tptr->maxscore = maxscore;
+  tptr->moveSquare = moveSquare;
+  tptr->moveIndex = moveIndex;
+  tptr->totalExplored = 0;
+  printf ("spawning thread: %d\n", moveIndex);
+  fflush (stdout);
+  error = pthread_create (&tptr->tid, NULL,
+			  worker_thread, tptr);
+  if (error != 0)
+    {
+      printf ("pthread_create error: %s\n", strerror (error));
+      fflush (stdout);
+      exit (1);
+    }
+}
+
+
+int parallelSearch (int *totalExplored, int *move,
+		    int best, int *moveList, int noOfMoves,
+		    BITSET64 colour, BITSET64 used, int noPlies,
+		    int playerColour, int minscore, int maxscore)
+{
+  threadInfo moveChoice[noOfMoves];
+  int moveComplete = 0;
+  int moveIndex = 0;
+  int nProcs = processorAvailable;
+  int result;
+  int moveSquare;
+  int moveFinish;
+  int error;
+
+  /* Firstly we farm out as many moves as we have processors.  */
+  printf ("%d moves to explore\n", noOfMoves);
+  while ((moveIndex < noOfMoves) && (nProcs > 0))
+    {
+      threadInfo *tptr = (threadInfo *)&moveChoice[moveIndex];
+      spawnThread (tptr, colour, used, noPlies,
+		   playerColour, minscore, maxscore,
+		   moveList[moveIndex], moveIndex);
+      moveIndex++;
+      nProcs--;
+    }
+  /* Now we wait until all top level ply moves have been explored.
+     We might need to farm out another worker if the number of cores < no of moves.
+     Remember the move exploration might complete in an indeterminant order.  */
+  while (moveComplete < noOfMoves)
+    {
+      /* Notice that moveFinish is used here until the join as
+	 we must not interfere with the moveIndex.  */
+      mailbox_rec (thread_comms, &result, &moveFinish, &moveSquare);
+      /* Which thread (move) completed?  */
+      printf ("thread %d complete, score %d, square %d\n",
+	      moveFinish, result, moveSquare);
+      fflush (stdout);
+      threadInfo *tptr = (threadInfo *)&moveChoice[moveFinish];
+      int ret;
+#if 0
+      /* Tidy up finishing thread.  */
+      error = pthread_join (tptr->tid, NULL);
+      if (error != 0)
+	{
+	  printf ("pthread_join error: %s\n", strerror (error));
+	  fflush (stdout);
+	  exit (1);
+	}
+#endif
+
+      /* Update the number of moves explored.  */
+      (*totalExplored) += tptr->totalExplored;
+      moveComplete++;
+      /* Was this move better than the previous best?  */
+      if (result > best)
+	{
+	  best = result;
+	  *move = moveSquare;
+	}
+      /* If we have more moves to explore then start a new thread.  */
+      if (moveIndex < noOfMoves)
+	{
+	  spawnThread (tptr, colour, used, noPlies,
+		       playerColour, minscore, maxscore,
+		       moveList[moveIndex], moveIndex);
+	  moveIndex++;
+	}
+    }
+  return best;
 }
 #endif
 
@@ -701,14 +827,13 @@ int sequentialSearch (int *totalExplored, int *move,
 
   for (i=0; i < noOfMoves; i++)
     {
-      try = alphaBeta (l[i], c, u, noPlies, o, minscore, maxscore);
+      try = alphaBeta (l[i], c, u, noPlies, o, minscore, maxscore, totalExplored);
       if (try > best)
 	{
 	  best = try;
 	  *move = l[i];
 	}
     }
-  *totalExplored = positionsExplored;
   return best;
 }
 
@@ -734,7 +859,9 @@ static int decideMove (BITSET64 c, BITSET64 u, int o, int n, int *l)
   printf("I'm going to look %d moves ahead...\n", noPlies);
   if (noPlies + g>=MAXPOS)
     printf("I should be able to see the end position...\n");
+#if defined(SEQUENTIAL)
   positionsExplored = 0;  /* global count reset.  */
+#endif
   start = time(NULL);
   best = MINSCORE-1;  /* ensures that no matter what we will initially set best
                          to the first move available. */
@@ -767,13 +894,19 @@ static int decideMove (BITSET64 c, BITSET64 u, int o, int n, int *l)
     printf("I took %d seconds and evaluated %d positions,\nsorry about the wait, I took too long so\nI will reduce my search next go..\n",
 	   (int)(end-start), totalExplored);
     if (noPlies > 1)
-      noPlies -= 2;
+      {
+	noPlies -= 2;
+    	printf ("next time I'll look %d moves ahead\n", noPlies);
+      }
   }
   else {
     printf("time took %d seconds and evaluated %d positions\n",
 	   (int)(end-start), totalExplored);
-    if (end-start < timePerMove / 10)
-      noPlies += 2;
+    if ((end-start) * 10 < timePerMove)
+      {
+	noPlies += 2;
+	printf ("next time I'll look %d moves ahead\n", noPlies);
+      }
   }
 
   return move;
@@ -819,7 +952,7 @@ int main()
 #endif
 
   // setupTest();
-  setup();
+  setupBoard ();
 
   f = 0;
   while (f != 2) {

@@ -3,7 +3,7 @@ SUFFIXES = .c .o .obj .lo .a
 
 MY_DEPS =  multiprocessor.o mailbox.o paro64bit.o
 
-OPT=-O0 -g
+CFLAGS=-O0 -g
 
 all-local:  reversi$(EXEEXT)
 
@@ -15,5 +15,8 @@ sequential-reversi$(EXEEXT):
 
 install-exec-local:  reversi$(EXEEXT)
 	install -m 755 reversi$(EXEEXT) $(DESTDIR)$(prefix)/bin
+
+clean:
+	$(RM) *.o reversi
 
 force:

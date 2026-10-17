@@ -18,20 +18,23 @@
 #include <semaphore.h>
 
 #include "multiprocessor.h"
+#define MAX_MOVES 64
 
 typedef struct triple_t {
   int result;
   int move_no;
-  int positions_explored;
+  int move_square;
 } triple;
 
 
 typedef struct mailbox_t {
-  triple data;
+  triple data[MAX_MOVES];
+  unsigned int in;
+  unsigned int out;
   sem_t *item_available;    /* are there data in the mailbox?  */
   sem_t *space_available;   /* space for more data in the mailbox.  */
   sem_t *mutex;             /* access to the mailbox.  */
-  struct mailbox_t *prev;  /* previous mailbox.  */
+  struct mailbox_t *prev;   /* previous mailbox.  */
 } mailbox;
 
 
@@ -60,21 +63,21 @@ EXTERN mailbox *mailbox_init (void);
 
 
 /*
- *  send - send (result, move_no, positions_explored) to the mailbox mbox.
+ *  send - send (result, move_no, move_square) to the mailbox mbox.
  */
 
 EXTERN void mailbox_send (mailbox *mbox,
-			  int result, int move_no, int positions_explored);
+			  int result, int move_no, int move_square);
 
 
 /*
- *  rec - receive (result, move_no, positions_explored) from the
+ *  rec - receive (result, move_no, move_square) from the
  *        mailbox mbox.
  */
 
 EXTERN void mailbox_rec (mailbox *mbox,
 			 int *result, int *move_no,
-			 int *positions_explored);
+			 int *move_square);
 
 #  undef EXTERN
 #endif /* !mailbox_h.  */
