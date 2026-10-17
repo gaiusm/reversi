@@ -1,4 +1,4 @@
-2021-10-17  <gaiusmod2@gmail.com>
+2026-10-17  <gaiusmod2@gmail.com>
 
 	* Implemented simple parallel search using pthreads.
 	* Changed the initial ply settings.
