@@ -34,7 +34,7 @@ typedef struct mailbox_t {
   sem_t *item_available;    /* are there data in the mailbox?  */
   sem_t *space_available;   /* space for more data in the mailbox.  */
   sem_t *mutex;             /* access to the mailbox.  */
-  struct mailbox_t *prev;   /* previous mailbox.  */
+  struct mailbox_t *next;   /* next mailbox.  */
 } mailbox;
 
 
@@ -78,6 +78,17 @@ EXTERN void mailbox_send (mailbox *mbox,
 EXTERN void mailbox_rec (mailbox *mbox,
 			 int *result, int *move_no,
 			 int *move_square);
+
+/*
+ *  kill - return the mailbox to the freelist.  No process must use this
+ *         mailbox.
+ */
+
+EXTERN mailbox *mailbox_kill (mailbox *mbox);
+
+/* Initialize the mailbox module.  */
+
+EXTERN void mailbox_initialization (void);
 
 #  undef EXTERN
 #endif /* !mailbox_h.  */

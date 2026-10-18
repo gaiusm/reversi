@@ -63,7 +63,7 @@ Free Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
 #define MAXPLY             18
 #define MAXMOVES           60
 
-#undef USE_CORNER_SCORES
+#define USE_CORNER_SCORES
 
 #if defined(USE_CORNER_SCORES)
 #  define CORNERVAL       (64*4)
@@ -83,7 +83,6 @@ Free Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
 #define WINSCORE       (64*PIECEVAL)
 #define LOOSESCORE    (-64*PIECEVAL)
 
-#define AmountOfTime        1      /* seconds */
 #define WHITE               1
 #define BLACK               0
 
@@ -92,17 +91,93 @@ typedef unsigned long long BITSET64;
 static BITSET64 Colours;
 static BITSET64 Used;
 static int noPlies = INITIALPLY;
-static int timePerMove = 10;
-#if defined(SEQUENTIAL)
-static int positionsExplored;  /* no of positions evaluated in the current move.  */
-#endif
+static int timePerMove = 20;
 
-#if 0
-static int bestMove[MAXPLY+1];
-static int bestMoveDepth;
-static int currentMove[MAXPLY+1];
-static int currentDepth;
-#endif
+static int positionsExplored;  /* no of positions evaluated in the current move.  */
+static int processorAvailable;
+static sem_t *processorSem;  /* Guards access to processorAvailable.  */
+static mailbox *topLevelComms;
+
+typedef struct moveThread_t {
+  pthread_t tid;
+  BITSET64 colour;
+  BITSET64 used;
+  int noPlies;
+  int playerColour;
+  int minscore;
+  int maxscore;
+  int moveSquare;
+  int moveIndex;
+  int totalExplored;
+  mailbox *threadComms;
+} threadInfo;
+
+
+static int alphaBeta (int move, BITSET64 colour, BITSET64 used,
+		      int depth, int player,
+		      int alpha, int beta, int *totalExplored);
+
+static int sequentialAlphaBeta (int move, BITSET64 colour, BITSET64 used,
+				int depth, int player,
+				int alpha, int beta, int *totalExplored,
+				int tilesTurned, int noOfMoves, int moveList[]);
+
+
+static
+void
+signalProcessorAvailable (void)
+{
+  multiprocessor_wait (processorSem);
+  processorAvailable++;
+  multiprocessor_signal (processorSem);
+}
+
+
+void *worker_thread (void *arg)
+{
+  threadInfo *ptr = (threadInfo *)arg;
+
+  int attempt = alphaBeta (ptr->moveSquare, ptr->colour, ptr->used,
+			   ptr->noPlies, ptr->playerColour,
+			   ptr->minscore, ptr->maxscore, &ptr->totalExplored);
+  /* We return our results.  */
+  mailbox_send (ptr->threadComms, attempt, ptr->moveIndex, ptr->moveSquare);
+  // signalProcessorAvailable ();
+  return NULL;
+}
+
+
+void
+spawnThread (threadInfo *tptr, BITSET64 colour, BITSET64 used,
+	     int noPlies, int playerColour,
+	     int minscore, int maxscore,
+	     int moveSquare, int moveIndex,
+	     mailbox *threadComms)
+{
+  int error;
+
+  tptr->colour = colour;
+  tptr->used = used;
+  tptr->noPlies = noPlies;
+  tptr->playerColour = playerColour;
+  tptr->minscore = minscore;
+  tptr->maxscore = maxscore;
+  tptr->moveSquare = moveSquare;
+  tptr->moveIndex = moveIndex;
+  tptr->totalExplored = 0;
+  tptr->threadComms = threadComms;
+  // printf ("spawning thread: %d\n", moveIndex);
+  fflush (stdout);
+  error = pthread_create (&tptr->tid, NULL,
+			  worker_thread, tptr);
+  if (error != 0)
+    {
+      printf ("pthread_create error: %s\n", strerror (error));
+      fflush (stdout);
+      exit (1);
+    }
+  pthread_detach (tptr->tid);  /* Allow the worker to run independently.  */
+}
 
 
 /*
@@ -489,27 +564,29 @@ static int countCounters (BITSET64 u)
 }
 
 /*
- *  findPossible - returns the number of legal moves found.
- *                 These are also assigned to the bitset, m.
+ *  findPossible - returns the number of moves found.
+ *                 These are also assigned to the bitset possible.
  */
 
-static int findPossible (BITSET64 Colours, BITSET64 Used, int o, BITSET64 *m, int l[])
+static int findPossible (BITSET64 Colours, BITSET64 Used, int player,
+			 BITSET64 *possible, int moveList[])
 {
-  int n, p, i;
-  BITSET64 nc, nu;
+  int count, pos, tilesTurned;
+  BITSET64 newColour, newUsed;
 
-  n = 0;
-  for (p = 0; p<MAXPOS; p++) {
-    i = makeMove(Colours, Used, p, o, m, &nc, &nu);
-    if (i > 0) {
-      /* printf("legal position %d\n", p); */
-      INCL(m, p);
-      if (l != NULL)
-	l[n] = p;
-      n++;
+  count = 0;
+  for (pos = 0; pos < MAXPOS; pos++) {
+    tilesTurned = makeMove (Colours, Used, pos, player,
+			    possible, &newColour, &newUsed);
+    if (tilesTurned > 0) {
+      /* printf("position %d\n", pos); */
+      INCL (possible, pos);
+      if (moveList != NULL)
+	moveList[count] = pos;
+      count++;
     }
   }
-  return n;
+  return count;
 }
 
 /*
@@ -571,70 +648,167 @@ static int humanMove (BITSET64 c, BITSET64 u, int o)
   return TRUE;
 }
 
-/*
- *  alphaBeta - returns the score estimated should move, p, be chosen.
- *              The board, c, u, is in the state _before_ move p is made.
- *              o is the colour who is attempting to play move, p.
- */
 
-static int alphaBeta (int p, BITSET64 c, BITSET64 u, int depth, int o,
-		      int alpha, int beta, int *totalExplored)
+static
+int
+parallelPlySearch (int move, BITSET64 colour, BITSET64 used,
+		   int depth, int player,
+		   int alpha, int beta, int *totalExplored,
+		   int tilesTurned, int noOfMoves, int moveList[])
 {
-  BITSET64 m, nc, nu;
-  int n, try;
-
-  if (p == -1) {
-    /* no move was possible */
-    nc = c;
-    nu = u;
+  if (noOfMoves == 0) {
+    if (move == -1)
+      return evaluate (colour, used, TRUE, totalExplored);
+    else
+      /* player forfits a go and 1-player plays a move instead.  */
+      return alphaBeta (-1, colour, used,
+			depth, 1-player, alpha, beta, totalExplored);
   }
   else
-    n = makeMove (c, u, p, o, &m, &nc, &nu);
+    {
+      /* A move for colour player is possible, continue searching.  */
+      mailbox *comms = mailbox_init ();
+      threadInfo moveChoice[noOfMoves];
 
-  o = 1-o;
-  if (depth == 0)
-    return evaluate (c, u, FALSE, totalExplored);
-  else {
-    int l[MAXMOVES];
-    int n = findPossible (nc, nu, o, &m, l);
-    int i;
-
-    if (n == 0) {
-      if (p == -1)
-	return evaluate (nc, nu, TRUE, totalExplored);
+      // printf ("parallelising ply of: %d moves\n", noOfMoves);
+      /* Spawn all threads, one per move choice.  */
+      for (int moveIndex = 0; moveIndex < noOfMoves; moveIndex++)
+	spawnThread (&moveChoice[moveIndex], colour, used,
+		     depth-1, player,
+		     alpha, beta, moveList[moveIndex], moveIndex, comms);
+      if (player == WHITE)
+	{
+	  /* Now collect the results.  */
+	  for (int i = 0; i < noOfMoves; i++)
+	    {
+	      int attempt;
+	      int moveFinish;
+	      int moveSquare;
+	      /* Out of order sequence is likely.  */
+	      mailbox_rec (comms, &attempt, &moveFinish, &moveSquare);
+	      if (attempt > alpha)
+		/* Found a better move.  */
+		alpha = attempt;
+	      /* Sadly we cannot optimise:
+		 if (alpha >= beta)
+                    return alpha;
+		    as we must wait for all threads to finish before returning.  */
+	    }
+	  comms = mailbox_kill (comms);
+	  return alpha;  /* The best score for a move WHITE has found.  */
+	}
       else
-	/* o, forfits a go and 1-o plays a move instead */
-	return alphaBeta (-1, nc, nu, depth, 1-o, alpha, beta, totalExplored);
+	{
+	  /* Now collect the results.  */
+	  for (int i = 0; i < noOfMoves; i++)
+	    {
+	      int attempt;
+	      int moveFinish;
+	      int moveSquare;
+	      /* Out of order sequence is likely.  */
+	      mailbox_rec (comms, &attempt, &moveFinish, &moveSquare);
+	      if (attempt < beta)
+		/* Found a better move.  */
+		beta = attempt;
+	      /* Again we cannot optimise:
+              if (alpha >= beta)
+	      return beta; as we must wait for all threads to complete.  */
+	    }
+	  comms = mailbox_kill (comms);
+	  return beta;  /* The best score for a move BLACK has found.  */
+	}
     }
-    else if (o == WHITE) {
-      /* white to move, move is possible, continue searching */
-      for (i=0; i<n; i++) {
-	try = alphaBeta (l[i], nc, nu, depth-1, WHITE,
-			 alpha, beta, totalExplored);
-	if (try > alpha)
-	  /* found a better move */
-	  alpha = try;
-	if (alpha >= beta)
-	  return alpha;
-      }
-      return alpha;  /* the best score for a move WHITE has found */
-    }
-    else {
-      /* black to move, move is possible, continue searching */
-      for (i=0; i<n; i++) {
-	try = alphaBeta (l[i], nc, nu, depth-1, BLACK,
-			 alpha, beta, totalExplored);
-	if (try < beta)
-	  /* found a better move */
-	  beta = try;
-	if (alpha >= beta)
-	  return beta;  /* no point searching further as WHITE would choose
-			   a different previous move */
-      }
-      return beta;  /* the best score for a move BLACK has found */
-    }
-  }
 }
+
+
+static
+int
+sequentialAlphaBeta (int move, BITSET64 colour, BITSET64 used,
+		     int depth, int player,
+		     int alpha, int beta, int *totalExplored,
+		     int tilesTurned, int noOfMoves, int moveList[])
+{
+  if (noOfMoves == 0) {
+    if (move == -1)
+      return evaluate (colour, used, TRUE, totalExplored);
+    else
+      /* player forfits a go and 1-player plays a move instead.  */
+      return alphaBeta (-1, colour, used,
+			depth, 1-player, alpha, beta, totalExplored);
+  }
+  else if (player == WHITE)
+    {
+      int attempt;
+      /* White to move, move is possible, continue searching.  */
+      for (int i = 0; i < noOfMoves; i++)
+	{
+	  attempt = alphaBeta (moveList[i], colour, used,
+			       depth-1, WHITE,
+			       alpha, beta, totalExplored);
+	  if (attempt > alpha)
+	    /* found a better move */
+	    alpha = attempt;
+	  if (alpha >= beta)
+	    return alpha;
+	}
+      return alpha;  /* The best score for a move WHITE has found.  */
+    }
+  else
+    {
+      int attempt;
+      /* Black to move, move is possible, continue searching.  */
+      for (int i = 0; i < noOfMoves; i++)
+	{
+	  attempt = alphaBeta (moveList[i], colour, used,
+			       depth-1, BLACK,
+			       alpha, beta, totalExplored);
+	  if (attempt < beta)
+	    /* Found a better move.  */
+	    beta = attempt;
+	  if (alpha >= beta)
+	    return beta;  /* No point searching further as WHITE would choose
+			     a different previous move.  */
+	}
+      return beta;  /* The best score for a move BLACK has found.  */
+    }
+}
+
+
+/*
+ *  alphaBeta - returns the estimated score should move be chosen.
+ *              The board colour and used is in the state _before_ move is made.
+ *              player is the colour who is attempting to play move.
+ */
+
+static int alphaBeta (int move, BITSET64 colour, BITSET64 used, int depth, int player,
+		      int alpha, int beta, int *totalExplored)
+{
+  BITSET64 possibleMoves, newColour, newUsed;
+  int tilesTurned;
+
+  if (move == -1) {
+    /* no move was possible */
+    newColour = colour;
+    newUsed = used;
+  }
+  else
+    tilesTurned = makeMove (colour, used, move, player,
+			    &possibleMoves, &newColour, &newUsed);
+  player = 1-player;
+  if (depth == 0)
+    /* At the end of our depth limit, we evaluate and return.  */
+    return evaluate (colour, used, FALSE, totalExplored);
+  else
+    {
+      int moveList[MAXMOVES];
+      int noOfMoves = findPossible (newColour, newUsed, player,
+				    &possibleMoves, moveList);
+      return sequentialAlphaBeta (move, newColour, newUsed, depth, player,
+				  alpha, beta, totalExplored, tilesTurned,
+				  noOfMoves, moveList);
+    }
+}
+
 
 /*
  *  finalScore - returns the final score.
@@ -679,70 +853,13 @@ static void displayBestMoves (int depth, int o)
 }
 #endif
 
-static mailbox *thread_comms;
-static int processorAvailable;
 
 void setupIPC (void)
 {
-  thread_comms = mailbox_init ();
+  mailbox_initialization ();
+  topLevelComms = mailbox_init ();
   processorAvailable = multiprocessor_maxProcessors ();
-}
-
-
-#if !defined(SEQUENTIAL)
-typedef struct moveThread_t {
-  pthread_t tid;
-  BITSET64 colour;
-  BITSET64 used;
-  int noPlies;
-  int playerColour;
-  int minscore;
-  int maxscore;
-  int moveSquare;
-  int moveIndex;
-  int totalExplored;
-} threadInfo;
-
-
-void *worker_thread (void *arg)
-{
-  threadInfo *ptr = (threadInfo *)arg;
-
-  int attempt = alphaBeta (ptr->moveSquare, ptr->colour, ptr->used,
-			   ptr->noPlies, ptr->playerColour,
-			   ptr->minscore, ptr->maxscore, &ptr->totalExplored);
-  /* We return our results.  */
-  mailbox_send (thread_comms, attempt, ptr->moveIndex, ptr->moveSquare);
-  return NULL;
-}
-
-void
-spawnThread (threadInfo *tptr, BITSET64 colour, BITSET64 used,
-	     int noPlies, int playerColour,
-	     int minscore, int maxscore,
-	     int moveSquare, int moveIndex)
-{
-  int error;
-
-  tptr->colour = colour;
-  tptr->used = used;
-  tptr->noPlies = noPlies;
-  tptr->playerColour = playerColour;
-  tptr->minscore = minscore;
-  tptr->maxscore = maxscore;
-  tptr->moveSquare = moveSquare;
-  tptr->moveIndex = moveIndex;
-  tptr->totalExplored = 0;
-  printf ("spawning thread: %d\n", moveIndex);
-  fflush (stdout);
-  error = pthread_create (&tptr->tid, NULL,
-			  worker_thread, tptr);
-  if (error != 0)
-    {
-      printf ("pthread_create error: %s\n", strerror (error));
-      fflush (stdout);
-      exit (1);
-    }
+  processorSem = multiprocessor_initSem (multiprocessor_maxProcessors ());
 }
 
 
@@ -767,7 +884,7 @@ int parallelSearch (int *totalExplored, int *move,
       threadInfo *tptr = (threadInfo *)&moveChoice[moveIndex];
       spawnThread (tptr, colour, used, noPlies,
 		   playerColour, minscore, maxscore,
-		   moveList[moveIndex], moveIndex);
+		   moveList[moveIndex], moveIndex, topLevelComms);
       moveIndex++;
       nProcs--;
     }
@@ -778,30 +895,22 @@ int parallelSearch (int *totalExplored, int *move,
     {
       /* Notice that moveFinish is used here until the join as
 	 we must not interfere with the moveIndex.  */
-      mailbox_rec (thread_comms, &result, &moveFinish, &moveSquare);
+      mailbox_rec (topLevelComms, &result, &moveFinish, &moveSquare);
       /* Which thread (move) completed?  */
       printf ("thread %d complete, score %d, square %d\n",
 	      moveFinish, result, moveSquare);
       fflush (stdout);
       threadInfo *tptr = (threadInfo *)&moveChoice[moveFinish];
       int ret;
-#if 0
-      /* Tidy up finishing thread.  */
-      error = pthread_join (tptr->tid, NULL);
-      if (error != 0)
-	{
-	  printf ("pthread_join error: %s\n", strerror (error));
-	  fflush (stdout);
-	  exit (1);
-	}
-#endif
 
       /* Update the number of moves explored.  */
       (*totalExplored) += tptr->totalExplored;
       moveComplete++;
       /* Was this move better than the previous best?  */
-      if (result > best)
+      if ((result > best) || ((result == best) && (moveSquare > *move)))
 	{
+	  /* We make a choice to always choose the higher move,
+	     mainly to aid debugging consistency.  */
 	  best = result;
 	  *move = moveSquare;
 	}
@@ -810,31 +919,46 @@ int parallelSearch (int *totalExplored, int *move,
 	{
 	  spawnThread (tptr, colour, used, noPlies,
 		       playerColour, minscore, maxscore,
-		       moveList[moveIndex], moveIndex);
+		       moveList[moveIndex], moveIndex, topLevelComms);
 	  moveIndex++;
 	}
     }
   return best;
 }
-#endif
 
 
 int sequentialSearch (int *totalExplored, int *move,
-		      int best, int *l, int noOfMoves,
-		      BITSET64 c, BITSET64 u, int noPlies, int o, int minscore, int maxscore)
+		      int best, int *moveList, int noOfMoves,
+		      BITSET64 colour, BITSET64 used, int noPlies,
+		      int playerColour, int minscore, int maxscore)
 {
-  int i, try;
+  int i, attempt;
 
   for (i=0; i < noOfMoves; i++)
     {
-      try = alphaBeta (l[i], c, u, noPlies, o, minscore, maxscore, totalExplored);
-      if (try > best)
+      attempt = alphaBeta (moveList[i], colour, used, noPlies, playerColour,
+			   minscore, maxscore, totalExplored);
+      if (attempt > best)
 	{
-	  best = try;
-	  *move = l[i];
+	  best = attempt;
+	  *move = moveList[i];
 	}
     }
   return best;
+}
+
+
+int topLevelDispatcher (int *totalExplored, int *move,
+			int best, int *moveList, int noOfMoves,
+			BITSET64 colour, BITSET64 used, int noPlies,
+			int playerColour, int minscore, int maxscore)
+{
+  if (processorAvailable > 1)
+    return parallelSearch (totalExplored, move, best, moveList, noOfMoves,
+			   colour, used, noPlies, playerColour, minscore, maxscore);
+  else
+    return sequentialSearch (totalExplored, move, best, moveList, noOfMoves,
+			     colour, used, noPlies, playerColour, minscore, maxscore);
 }
 
 
@@ -865,11 +989,7 @@ static int decideMove (BITSET64 c, BITSET64 u, int o, int n, int *l)
   start = time(NULL);
   best = MINSCORE-1;  /* ensures that no matter what we will initially set best
                          to the first move available. */
-#if defined(SEQUENTIAL)
-  best = sequentialSearch (&totalExplored, &move, best, l, n, c, u, noPlies, o, MINSCORE, MAXSCORE);
-#else
-  best = parallelSearch (&totalExplored, &move, best, l, n, c, u, noPlies, o, MINSCORE, MAXSCORE);
-#endif
+  best = topLevelDispatcher (&totalExplored, &move, best, l, n, c, u, noPlies, o, MINSCORE, MAXSCORE);
   end = time(NULL) ;
 
 #if 0
