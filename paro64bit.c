@@ -95,7 +95,6 @@ static int timePerMove = 20;
 
 static int positionsExplored;  /* no of positions evaluated in the current move.  */
 static int processorAvailable;
-static sem_t *processorSem;  /* Guards access to processorAvailable.  */
 static mailbox *topLevelComms;
 
 typedef struct moveThread_t {
@@ -121,16 +120,6 @@ static int sequentialAlphaBeta (int move, BITSET64 colour, BITSET64 used,
 				int depth, int player,
 				int alpha, int beta, int *totalExplored,
 				int tilesTurned, int noOfMoves, int moveList[]);
-
-
-static
-void
-signalProcessorAvailable (void)
-{
-  multiprocessor_wait (processorSem);
-  processorAvailable++;
-  multiprocessor_signal (processorSem);
-}
 
 
 void *worker_thread (void *arg)
@@ -859,7 +848,6 @@ void setupIPC (void)
   mailbox_initialization ();
   topLevelComms = mailbox_init ();
   processorAvailable = multiprocessor_maxProcessors ();
-  processorSem = multiprocessor_initSem (multiprocessor_maxProcessors ());
 }
 
 

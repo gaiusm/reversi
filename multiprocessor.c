@@ -97,11 +97,7 @@ void multiprocessor_killSem (sem_t *base_sem)
 void *multiprocessor_initSharedMemory (unsigned int mem_size)
 {
   void *allocated;
-#if 0
-  key_t segid = ftok (".", 'R');
-#else
   key_t segid = IPC_PRIVATE;
-#endif
   int shmid = shmget (segid, mem_size + MAX_SEMAPHORES * sizeof (sem_t), IPC_CREAT | 0660);
   if (shmid < 0)
     {
